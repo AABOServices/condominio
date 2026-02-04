@@ -32,7 +32,7 @@ def calcular_fondos(monto):
 st.set_page_config(page_title="Condominio 2025", layout="wide")
 init_db()
 
-st.title("🏢 Gestión Condominio 2025")
+st.title("🏢 Gestión Condominio NANTU")
 
 # Login simple para el ejemplo
 if 'conectado' not in st.session_state:

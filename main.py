@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import hashlib
-import os
 import subprocess
 import sys
 
 DB_PATH = "condominio.db"
+
 
 # ------------------ DB ------------------
 def init_db():
@@ -35,6 +35,7 @@ def init_db():
         )"""
     )
 
+    # Usuario por defecto: admin / clave: admin123
     pw_hash = hashlib.sha256("admin123".encode()).hexdigest()
     c.execute("INSERT OR IGNORE INTO usuarios VALUES ('admin', ?, 'ADMINISTRADOR')", (pw_hash,))
 
@@ -80,10 +81,21 @@ def cargar_df_pagos():
     conn.close()
 
     if not df.empty:
-        # Normaliza fecha para filtros
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
 
     return df
+
+
+def ejecutar_importacion_con_log(script_name="importar_datos.py"):
+    """
+    Ejecuta el script de importación y devuelve stdout/stderr/returncode para visualizar en Streamlit.
+    """
+    result = subprocess.run(
+        [sys.executable, script_name],
+        capture_output=True,
+        text=True
+    )
+    return result.returncode, result.stdout, result.stderr
 
 
 # ------------------ UI ------------------
@@ -92,12 +104,14 @@ init_db()
 
 st.title("🏢 CONDOMINIOS NANTU")
 
+# Session State
 if "conectado" not in st.session_state:
     st.session_state.conectado = False
 if "user" not in st.session_state:
     st.session_state.user = ""
 if "rol" not in st.session_state:
     st.session_state.rol = ""
+
 
 # ------------------ LOGIN ------------------
 if not st.session_state.conectado:
@@ -113,8 +127,9 @@ if not st.session_state.conectado:
         else:
             st.sidebar.error("Error de acceso (usuario/clave incorrectos)")
 
-    st.info("Ingresa con tus credenciales para gestionar pagos y ver el histórico.")
+    st.info("Ingresa con tus credenciales para gestionar pagos, histórico y dashboard.")
     st.stop()
+
 
 # ------------------ APP ------------------
 st.sidebar.success(f"Conectado como: {st.session_state.user}")
@@ -122,44 +137,45 @@ st.sidebar.write(f"Rol: **{st.session_state.rol}**")
 
 menu = st.sidebar.radio("Menú", ["Dashboard", "Cargar Pago", "Histórico", "Administrador"])
 
+
 # ------------------ ADMIN ------------------
 if menu == "Administrador":
     st.subheader("🛠 Administración del Sistema")
 
     st.warning(
-        "⚠️ Ejecuta la carga histórica UNA sola vez (o con control anti-duplicados). "
-        "Si ya cargaste, no lo repitas."
+        "⚠️ Si ya cargaste históricos una vez, no repitas sin control de duplicados. "
+        "Ahora te muestro el log real para saber por qué falló."
     )
 
-   if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
-    try:
-        result = subprocess.run(
-            [sys.executable, "importar_datos.py"],
-            capture_output=True,
-            text=True
-        )
+    if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
+        returncode, stdout, stderr = ejecutar_importacion_con_log("importar_datos.py")
 
         st.write("### Resultado de ejecución")
-        st.write("**Return code:**", result.returncode)
+        st.write("**Return code:**", returncode)
 
-        if result.stdout:
-            st.code(result.stdout, language="text")
-        if result.stderr:
-            st.code(result.stderr, language="text")
-
-        if result.returncode == 0:
-            st.success("Carga histórica OK. Ve a Histórico/Dashboard.")
+        if stdout:
+            st.write("**STDOUT:**")
+            st.code(stdout, language="text")
         else:
-            st.error("La carga falló. Revisa el log arriba (stderr).")
+            st.write("**STDOUT:** (vacío)")
 
-    except Exception as e:
-        st.error(f"Error al ejecutar importar_datos.py: {e}")
+        if stderr:
+            st.write("**STDERR:**")
+            st.code(stderr, language="text")
+        else:
+            st.write("**STDERR:** (vacío)")
+
+        if returncode == 0:
+            st.success("✅ Carga histórica OK. Ve a Histórico/Dashboard.")
+        else:
+            st.error("❌ La carga falló. Revisa el STDERR arriba (ahí está el motivo real).")
 
     st.divider()
     df = cargar_df_pagos()
     st.write(f"Registros en base: **{len(df)}**")
     if not df.empty:
-        st.dataframe(df.tail(50), use_container_width=True)
+        st.dataframe(df.sort_values("fecha", ascending=False).head(50), use_container_width=True)
+
 
 # ------------------ CARGAR PAGO ------------------
 elif menu == "Cargar Pago":
@@ -172,6 +188,7 @@ elif menu == "Cargar Pago":
     if st.button("Guardar Registro"):
         p, d, s, o = guardar_pago(casa, str(fecha), float(monto), st.session_state.user)
         st.success(f"¡Guardado! Provisión: ${p} | Décimos: ${d} | Sueldo: ${s} | Operativo: ${o}")
+
 
 # ------------------ DASHBOARD ------------------
 elif menu == "Dashboard":
@@ -198,6 +215,7 @@ elif menu == "Dashboard":
         st.subheader("Últimos movimientos")
         st.dataframe(df.sort_values("fecha", ascending=False).head(30), use_container_width=True)
 
+
 # ------------------ HISTÓRICO ------------------
 elif menu == "Histórico":
     st.subheader("📚 Histórico de Pagos (Cargados + Manuales)")
@@ -205,10 +223,9 @@ elif menu == "Histórico":
     df = cargar_df_pagos()
 
     if df.empty:
-        st.info("No hay registros aún.")
+        st.info("No hay registros aún. Ve a Administrador para cargar históricos o registra un pago.")
     else:
-        # Filtros
-        casas = ["Todas"] + sorted([c for c in df["casa"].dropna().unique().tolist()])
+        casas = ["Todas"] + sorted(df["casa"].dropna().unique().tolist())
         casa_sel = st.selectbox("Filtrar por Casa", casas)
 
         min_fecha = df["fecha"].min()
@@ -230,7 +247,6 @@ elif menu == "Histórico":
 
         st.caption(f"Registros filtrados: {len(df_f)}")
 
-        # Totales del filtro
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Monto", f"${df_f['monto'].sum():,.2f}")
         c2.metric("Provisión", f"${df_f['provision'].sum():,.2f}")
@@ -241,7 +257,6 @@ elif menu == "Histórico":
         st.divider()
         st.dataframe(df_f.sort_values("fecha", ascending=False), use_container_width=True)
 
-        # Descarga CSV
         csv_bytes = df_f.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Descargar CSV (filtrado)",
@@ -250,6 +265,7 @@ elif menu == "Histórico":
             mime="text/csv",
         )
 
+
 # ------------------ LOGOUT ------------------
 st.sidebar.divider()
 if st.sidebar.button("Cerrar sesión"):
@@ -257,4 +273,3 @@ if st.sidebar.button("Cerrar sesión"):
     st.session_state.user = ""
     st.session_state.rol = ""
     st.rerun()
-

@@ -10,6 +10,14 @@ ARCHIVOS = [
 ]
 
 # ---------- Helpers ----------
+def norm_cell(x) -> str:
+    """Convierte NaN/None a '', y texto a string limpio."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    return "" if s.lower() == "nan" else s
+
+
 def money_to_float(x) -> float:
     if pd.isna(x):
         return 0.0
@@ -33,12 +41,8 @@ def money_to_float(x) -> float:
 
 
 def parse_fecha(valor_fecha, archivo: str) -> str:
-    """
-    Devuelve fecha YYYY-MM-DD.
-    Si la fila no trae fecha, toma YYYY-MM-01 según el nombre del archivo MMYYYY.csv
-    """
     if not pd.isna(valor_fecha):
-        s = str(valor_fecha).strip()
+        s = norm_cell(valor_fecha)
         if s and s != "0":
             dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
             if pd.notna(dt):
@@ -54,14 +58,13 @@ def parse_fecha(valor_fecha, archivo: str) -> str:
 
 
 def yyyymm(fecha_yyyy_mm_dd: str) -> str:
-    # "2025-07-02" -> "2025-07"
     return fecha_yyyy_mm_dd[:7]
 
 
 def extraer_codigo_casa(descripcion: str) -> str:
-    if descripcion is None:
+    s = norm_cell(descripcion)
+    if not s:
         return ""
-    s = str(descripcion).strip()
 
     m = re.match(r"^(C\d{2})\b", s, flags=re.IGNORECASE)
     if m:
@@ -75,23 +78,18 @@ def extraer_codigo_casa(descripcion: str) -> str:
 
 
 def es_fila_pago_principal(descripcion: str) -> bool:
-    if descripcion is None:
+    s = norm_cell(descripcion).lower()
+    if not s:
         return False
-    s = str(descripcion).strip().lower()
 
-    # excluir sublíneas de desglose
+    # excluir sublíneas
     if "provisi" in s or "décim" in s or "decim" in s or "sueldo" in s:
         return False
 
     return bool(re.match(r"^(c\d{2}|\d{2})\b", s))
 
 
-# ---------- Anti-duplicado por Casa+Mes ----------
 def existe_pago_casa_mes(cur, casa: str, fecha: str) -> bool:
-    """
-    Si ya existe un pago en ese mes para esa casa, no insertamos.
-    Comparo por strftime('%Y-%m', fecha) en SQLite.
-    """
     mes = yyyymm(fecha)
     row = cur.execute(
         """
@@ -123,22 +121,24 @@ def importar_historico():
             df = pd.read_csv(archivo, skiprows=2, encoding="latin1")
             cols = list(df.columns)
 
-            # columnas según tu formato real
             col_tipo = cols[0]
             col_desc = cols[1]
             col_fecha = cols[3]
             col_entra = cols[4]
 
-            # localizar bloque INGRESOS
-            idx_ing = df.index[df[col_tipo].astype(str).str.strip().eq("INGRESOS")]
+            # --- encontrar inicio de INGRESOS ---
+            idx_ing = df.index[df[col_tipo].fillna("").astype(str).str.strip().eq("INGRESOS")]
             if len(idx_ing) == 0:
                 print(f"⚠️ No se encontró sección INGRESOS en {archivo}")
                 continue
 
-            start = idx_ing[0]
+            start = int(idx_ing[0])
+
+            # --- encontrar fin del bloque INGRESOS ---
             end = len(df)
             for i in range(start + 1, len(df)):
-                v = str(df.loc[i, col_tipo]).strip()
+                v = norm_cell(df.loc[i, col_tipo])
+                # solo termina cuando aparece un encabezado REAL (texto no vacío)
                 if v and v != "INGRESOS":
                     end = i
                     break
@@ -164,7 +164,6 @@ def importar_historico():
                 if monto <= 0:
                     continue
 
-                # Anti-duplicado por casa+mes
                 if existe_pago_casa_mes(cur, casa, fecha):
                     saltados_arch += 1
                     continue

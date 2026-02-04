@@ -3,6 +3,8 @@ import pandas as pd
 import sqlite3
 import hashlib
 import os
+import subprocess
+import sys
 
 DB_PATH = "condominio.db"
 
@@ -129,15 +131,29 @@ if menu == "Administrador":
         "Si ya cargaste, no lo repitas."
     )
 
-    if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
-        try:
-            exit_code = os.system("python importar_datos.py")
-            if exit_code == 0:
-                st.success("Carga histórica ejecutada correctamente. Ve a 'Histórico' o 'Dashboard'.")
-            else:
-                st.error(f"La carga terminó con código {exit_code}. Revisa logs.")
-        except Exception as e:
-            st.error(f"Error al ejecutar carga: {e}")
+   if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
+    try:
+        result = subprocess.run(
+            [sys.executable, "importar_datos.py"],
+            capture_output=True,
+            text=True
+        )
+
+        st.write("### Resultado de ejecución")
+        st.write("**Return code:**", result.returncode)
+
+        if result.stdout:
+            st.code(result.stdout, language="text")
+        if result.stderr:
+            st.code(result.stderr, language="text")
+
+        if result.returncode == 0:
+            st.success("Carga histórica OK. Ve a Histórico/Dashboard.")
+        else:
+            st.error("La carga falló. Revisa el log arriba (stderr).")
+
+    except Exception as e:
+        st.error(f"Error al ejecutar importar_datos.py: {e}")
 
     st.divider()
     df = cargar_df_pagos()

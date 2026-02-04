@@ -50,16 +50,20 @@ if not st.session_state.conectado:
 else:
     menu = st.sidebar.radio("Menú", ["Dashboard", "Cargar Pago"])
 
-    if st.session_state.rol == "ADMINISTRADOR":
+    # ---- Carga historico
+
+    elif menu == "Administrador":
+    st.subheader("🛠 Administración del Sistema")
+
     if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
         try:
-            # Aquí llamamos a la lógica de importación
             import os
-            # Comando simple para ejecutar el script que creamos
             os.system("python importar_datos.py")
-            st.success("¡Datos históricos cargados! Refresca el Dashboard.")
-        except:
-            st.error("Asegúrate de haber subido los archivos CSV a GitHub.")
+            st.success("Carga histórica ejecutada correctamente")
+        except Exception as e:
+            st.error(f"Error al ejecutar carga: {e}")
+
+    # ---- Carga Pago
     
     if menu == "Cargar Pago":
         st.subheader("📝 Registrar nuevo ingreso")

@@ -49,6 +49,17 @@ if not st.session_state.conectado:
             st.sidebar.error("Error de acceso")
 else:
     menu = st.sidebar.radio("Menú", ["Dashboard", "Cargar Pago"])
+
+    if st.session_state.rol == "ADMINISTRADOR":
+    if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
+        try:
+            # Aquí llamamos a la lógica de importación
+            import os
+            # Comando simple para ejecutar el script que creamos
+            os.system("python importar_datos.py")
+            st.success("¡Datos históricos cargados! Refresca el Dashboard.")
+        except:
+            st.error("Asegúrate de haber subido los archivos CSV a GitHub.")
     
     if menu == "Cargar Pago":
         st.subheader("📝 Registrar nuevo ingreso")
@@ -74,15 +85,4 @@ else:
             st.metric("Total en Provisión", f"${df['provision'].sum():,.2f}")
         else:
             st.write("Aún no hay datos.")
-
-        if st.session_state.rol == "ADMINISTRADOR":
-    if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
-        try:
-            # Aquí llamamos a la lógica de importación
-            import os
-            # Comando simple para ejecutar el script que creamos
-            os.system("python importar_datos.py")
-            st.success("¡Datos históricos cargados! Refresca el Dashboard.")
-        except:
-            st.error("Asegúrate de haber subido los archivos CSV a GitHub.")
           

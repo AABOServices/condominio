@@ -9,9 +9,11 @@ ARCHIVOS = [
     "072025.csv", "082025.csv", "092025.csv", "102025.csv", "112025.csv", "122025.csv"
 ]
 
+USUARIO_CARGA = "SISTEMA_CARGA"
+
+
 # ---------- Helpers ----------
 def norm_cell(x) -> str:
-    """Convierte NaN/None a '', y texto a string limpio."""
     if pd.isna(x):
         return ""
     s = str(x).strip()
@@ -29,7 +31,7 @@ def money_to_float(x) -> float:
         s = s.replace("(", "").replace(")", "")
 
     s = s.replace("$", "").replace(" ", "").replace("\u00a0", "")
-    if s in ["-", "—", "", "0", "0.0"]:
+    if s in ["-", "—", ""]:
         return 0.0
 
     s = s.replace(",", "")
@@ -41,6 +43,7 @@ def money_to_float(x) -> float:
 
 
 def parse_fecha(valor_fecha, archivo: str) -> str:
+    # Intenta leer fecha real
     if not pd.isna(valor_fecha):
         s = norm_cell(valor_fecha)
         if s and s != "0":
@@ -48,6 +51,7 @@ def parse_fecha(valor_fecha, archivo: str) -> str:
             if pd.notna(dt):
                 return dt.strftime("%Y-%m-%d")
 
+    # Fallback: fecha primer día del mes según archivo MMYYYY.csv
     m = re.search(r"(\d{2})(\d{4})", archivo)
     if m:
         mm = int(m.group(1))
@@ -82,29 +86,39 @@ def es_fila_pago_principal(descripcion: str) -> bool:
     if not s:
         return False
 
-    # excluir sublíneas
+    # Excluir sublíneas Provisión/Décimos/Sueldo
     if "provisi" in s or "décim" in s or "decim" in s or "sueldo" in s:
         return False
 
     return bool(re.match(r"^(c\d{2}|\d{2})\b", s))
 
 
-def existe_pago_casa_mes(cur, casa: str, fecha: str) -> bool:
-    mes = yyyymm(fecha)
-    row = cur.execute(
+def calcular_fondos(monto: float):
+    prov = round(monto * 0.0338, 2)
+    deci = round(monto * 0.045, 2)
+    suel = round(monto * 0.20, 2)
+    oper = round(monto - prov - deci - suel, 2)
+    return prov, deci, suel, oper
+
+
+# ---------- Overwrite por Casa+Mes ----------
+def borrar_mes_casa(cur, casa: str, mes_yyyy_mm: str):
+    """
+    Borra registros previos de importación automática (SISTEMA_CARGA)
+    para esa casa y mes, y luego se reinsertan.
+    """
+    cur.execute(
         """
-        SELECT 1
-        FROM pagos
+        DELETE FROM pagos
         WHERE casa = ?
+          AND usuario = ?
           AND strftime('%Y-%m', fecha) = ?
-        LIMIT 1
         """,
-        (casa, mes)
-    ).fetchone()
-    return row is not None
+        (casa, USUARIO_CARGA, mes_yyyy_mm)
+    )
 
 
-def importar_historico():
+def importar_historico_overwrite():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -114,7 +128,6 @@ def importar_historico():
     """
 
     total_insertados = 0
-    total_saltados = 0
 
     for archivo in ARCHIVOS:
         try:
@@ -126,7 +139,7 @@ def importar_historico():
             col_fecha = cols[3]
             col_entra = cols[4]
 
-            # --- encontrar inicio de INGRESOS ---
+            # localizar bloque INGRESOS
             idx_ing = df.index[df[col_tipo].fillna("").astype(str).str.strip().eq("INGRESOS")]
             if len(idx_ing) == 0:
                 print(f"⚠️ No se encontró sección INGRESOS en {archivo}")
@@ -134,61 +147,14 @@ def importar_historico():
 
             start = int(idx_ing[0])
 
-            # --- encontrar fin del bloque INGRESOS ---
+            # fin bloque INGRESOS
             end = len(df)
             for i in range(start + 1, len(df)):
                 v = norm_cell(df.loc[i, col_tipo])
-                # solo termina cuando aparece un encabezado REAL (texto no vacío)
                 if v and v != "INGRESOS":
                     end = i
                     break
 
             bloque = df.iloc[start:end].copy()
 
-            insertados_arch = 0
-            saltados_arch = 0
-
-            for _, row in bloque.iterrows():
-                desc = row.get(col_desc, "")
-
-                if not es_fila_pago_principal(desc):
-                    continue
-
-                casa = extraer_codigo_casa(desc)
-                if not casa:
-                    continue
-
-                fecha = parse_fecha(row.get(col_fecha, None), archivo)
-                monto = money_to_float(row.get(col_entra, 0))
-
-                if monto <= 0:
-                    continue
-
-                if existe_pago_casa_mes(cur, casa, fecha):
-                    saltados_arch += 1
-                    continue
-
-                prov = round(monto * 0.0338, 2)
-                deci = round(monto * 0.045, 2)
-                suel = round(monto * 0.20, 2)
-                oper = round(monto - prov - deci - suel, 2)
-
-                cur.execute(insert_sql, (casa, fecha, monto, prov, deci, suel, oper, "SISTEMA_CARGA"))
-                insertados_arch += 1
-
-            conn.commit()
-            total_insertados += insertados_arch
-            total_saltados += saltados_arch
-            print(f"✅ {archivo}: insertados={insertados_arch} | saltados(duplicados casa+mes)={saltados_arch}")
-
-        except FileNotFoundError:
-            print(f"❌ No existe el archivo: {archivo}")
-        except Exception as e:
-            print(f"❌ Error en {archivo}: {e}")
-
-    conn.close()
-    print(f"\nRESUMEN: insertados={total_insertados} | saltados={total_saltados}")
-
-
-if __name__ == "__main__":
-    importar_historico()
+            # Primero recolectamos filas “principal

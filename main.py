@@ -9,17 +9,12 @@ import hashlib
 DB_PATH = "condominio.db"
 
 
-# ------------------ DB: esquema robusto ------------------
+# ------------------ DB: esquema mínimo + usuarios ------------------
 def ensure_schema():
-    """
-    Garantiza que existan:
-      - tabla usuarios
-      - tabla pagos con el nuevo esquema (o migra si viene viejo)
-    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # Usuarios
+    # usuarios
     cur.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             user TEXT PRIMARY KEY,
@@ -29,37 +24,6 @@ def ensure_schema():
     """)
     pw_hash = hashlib.sha256("admin123".encode()).hexdigest()
     cur.execute("INSERT OR IGNORE INTO usuarios VALUES ('admin', ?, 'ADMINISTRADOR')", (pw_hash,))
-
-    # Pagos (creación base)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pagos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT
-        )
-    """)
-
-    # Migración/alta de columnas del esquema nuevo
-    cols = [r[1] for r in cur.execute("PRAGMA table_info(pagos)").fetchall()]
-
-    def add_col(name, coltype):
-        if name not in cols:
-            cur.execute(f"ALTER TABLE pagos ADD COLUMN {name} {coltype}")
-
-    add_col("casa", "TEXT")
-    add_col("propietario", "TEXT")
-    add_col("monto_a_pagar", "REAL")
-    add_col("fecha_pago", "TEXT")
-    add_col("monto_pagado", "REAL")
-    add_col("provision", "REAL")
-    add_col("decimos", "REAL")
-    add_col("sueldo", "REAL")
-    add_col("saldo_pagar", "REAL")
-    add_col("usuario", "TEXT")
-
-    # Índice (opcional)
-    try:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pagos_casa_fecha ON pagos(casa, fecha_pago)")
-    except Exception:
-        pass
 
     conn.commit()
     conn.close()
@@ -77,15 +41,11 @@ def validar_login(user: str, pw: str) -> bool:
 
 
 def ejecutar_importacion_con_log(script_name="importar_datos.py"):
-    result = subprocess.run(
-        [sys.executable, script_name],
-        capture_output=True,
-        text=True
-    )
+    result = subprocess.run([sys.executable, script_name], capture_output=True, text=True)
     return result.returncode, result.stdout, result.stderr
 
 
-# ------------------ Data loader (tolerante a BD vieja) ------------------
+# ------------------ Cargar datos ------------------
 def cargar_df_pagos():
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -97,30 +57,19 @@ def cargar_df_pagos():
     if df.empty:
         return df
 
-    # Mapeo defensivo si vienen nombres viejos
-    # (por si aún quedaran 'fecha' o 'monto' en una BD vieja)
-    if "fecha_pago" not in df.columns and "fecha" in df.columns:
-        df["fecha_pago"] = df["fecha"]
-    if "monto_pagado" not in df.columns and "monto" in df.columns:
-        df["monto_pagado"] = df["monto"]
-
-    # Asegurar columnas existentes (si faltan, se crean en DF)
-    needed = [
-        "casa", "propietario", "monto_a_pagar", "fecha_pago", "monto_pagado",
-        "provision", "decimos", "sueldo", "saldo_pagar"
-    ]
+    # Asegura columnas clave (por si cambia algo)
+    needed = ["casa", "propietario", "fecha_pago", "monto_pagado", "saldo_pagar"]
     for c in needed:
         if c not in df.columns:
             df[c] = None
 
-    # Tipos
-    df["fecha_pago"] = pd.to_datetime(df["fecha_pago"], errors="coerce")
-    for c in ["monto_a_pagar", "monto_pagado", "provision", "decimos", "sueldo", "saldo_pagar"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["casa"] = df["casa"].fillna("").astype(str).str.strip().str.upper()
+    df["propietario"] = df["propietario"].fillna("").astype(str).str.strip()
 
-    # texto
-    df["casa"] = df["casa"].fillna("").astype(str)
-    df["propietario"] = df["propietario"].fillna("").astype(str)
+    df["fecha_pago"] = pd.to_datetime(df["fecha_pago"], errors="coerce")
+
+    for c in ["monto_pagado", "saldo_pagar"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
     return df
 
@@ -131,6 +80,7 @@ ensure_schema()
 
 st.title("🏢 CONDOMINIOS NANTU")
 
+# session
 if "conectado" not in st.session_state:
     st.session_state.conectado = False
 if "user" not in st.session_state:
@@ -138,7 +88,7 @@ if "user" not in st.session_state:
 if "rol" not in st.session_state:
     st.session_state.rol = ""
 
-# ---- Login ----
+# ------------------ Login ------------------
 if not st.session_state.conectado:
     st.sidebar.subheader("🔐 Acceso")
     user = st.sidebar.text_input("Usuario")
@@ -150,6 +100,7 @@ if not st.session_state.conectado:
             st.rerun()
         else:
             st.sidebar.error("Error de acceso (usuario/clave incorrectos)")
+
     st.info("Ingresa con tus credenciales para visualizar dashboard, históricos y administración.")
     st.stop()
 
@@ -158,7 +109,7 @@ st.sidebar.write(f"Rol: **{st.session_state.rol}**")
 
 menu = st.sidebar.radio("Menú", ["Dashboard", "Histórico", "Administrador"])
 
-# ---- Cargar datos ----
+# ------------------ Data ------------------
 df = cargar_df_pagos()
 
 # ------------------ Filtros globales ------------------
@@ -166,7 +117,7 @@ st.sidebar.divider()
 st.sidebar.subheader("🎛️ Filtros (globales)")
 
 if df.empty:
-    st.sidebar.info("No hay datos aún. Ejecuta la carga en 'Administrador'.")
+    st.sidebar.info("No hay datos. Ejecuta la carga desde 'Administrador'.")
     df_f = df
     casa_sel = "Todas"
     prop_filter = ""
@@ -187,62 +138,97 @@ else:
         f_fin = st.date_input("Hasta", value=max_fecha.date() if pd.notna(max_fecha) else None)
 
     df_f = df.copy()
+
     if casa_sel != "Todas":
         df_f = df_f[df_f["casa"] == casa_sel]
+
     if prop_filter.strip():
         df_f = df_f[df_f["propietario"].str.contains(prop_filter.strip(), case=False, na=False)]
+
     if f_ini and f_fin:
-        df_f = df_f[(df_f["fecha_pago"].dt.date >= f_ini) & (df_f["fecha_pago"].dt.date <= f_fin)]
+        df_f = df_f[
+            (df_f["fecha_pago"].dt.date >= f_ini) &
+            (df_f["fecha_pago"].dt.date <= f_fin)
+        ]
 
 
-# ------------------ Dashboard ------------------
+# ------------------ DASHBOARD ------------------
 if menu == "Dashboard":
-    st.subheader("📊 Dashboard (filtrado)")
+    st.subheader("📊 Dashboard por Casa (Pagado vs Saldo)")
 
     if df_f.empty:
         st.info("No hay datos para mostrar con los filtros seleccionados.")
     else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Monto a pagar (Σ)", f"${df_f['monto_a_pagar'].sum():,.2f}")
-        c2.metric("Monto pagado (Σ)", f"${df_f['monto_pagado'].sum():,.2f}")
-        c3.metric("Saldo a pagar (Σ)", f"${df_f['saldo_pagar'].sum():,.2f}")
-        c4.metric("Registros", f"{len(df_f)}")
+        # KPIs globales (filtrados)
+        total_pagado = df_f["monto_pagado"].sum()
+        total_saldo = df_f["saldo_pagar"].sum()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Monto Pagado (Σ)", f"${total_pagado:,.2f}")
+        c2.metric("Saldo por Pagar (Σ)", f"${total_saldo:,.2f}")
+        c3.metric("Registros (filtrados)", f"{len(df_f)}")
 
         st.divider()
 
-        # Agregado por mes
-        df_chart = df_f.copy()
-        df_chart["periodo"] = df_chart["fecha_pago"].dt.to_period("M").astype(str)
-        df_agg = df_chart.groupby("periodo", as_index=False)["saldo_pagar"].sum()
-        df_agg["signo"] = df_agg["saldo_pagar"].apply(lambda x: "Positivo" if x >= 0 else "Negativo")
+        # Agregado por CASA
+        agg = df_f.groupby(["casa"], as_index=False).agg(
+            monto_pagado_sum=("monto_pagado", "sum"),
+            saldo_pagar_sum=("saldo_pagar", "sum"),
+        )
 
-        color_scale = alt.Scale(domain=["Positivo", "Negativo"], range=["#2e7d32", "#ef6c00"])
+        # Construimos formato "long" para el chart:
+        # - Pagado (positivo)
+        # - Saldo por pagar (negativo)
+        rows = []
+        for _, r in agg.iterrows():
+            rows.append({"casa": r["casa"], "categoria": "Pagado", "valor": float(r["monto_pagado_sum"])})
+            rows.append({"casa": r["casa"], "categoria": "Saldo por pagar", "valor": -float(r["saldo_pagar_sum"])})
+
+        chart_df = pd.DataFrame(rows)
+
+        # Colores requeridos: positivo verde, negativo anaranjado
+        # OJO: aquí el color lo definimos por categoría (Pagado vs Saldo por pagar),
+        # porque el signo ya va por el valor (+ / -)
+        color_scale = alt.Scale(
+            domain=["Pagado", "Saldo por pagar"],
+            range=["#2e7d32", "#ef6c00"]  # verde / anaranjado
+        )
 
         bars = (
-            alt.Chart(df_agg)
+            alt.Chart(chart_df)
             .mark_bar()
             .encode(
-                x=alt.X("periodo:N", title="Período (YYYY-MM)", sort=None),
-                y=alt.Y("saldo_pagar:Q", title="Saldo a pagar (Σ)", axis=alt.Axis(format=",.2f")),
-                color=alt.Color("signo:N", scale=color_scale, legend=alt.Legend(title="Signo")),
+                x=alt.X("casa:N", title="Casa", sort="ascending"),
+                y=alt.Y("valor:Q", title="Monto (Σ) | Saldo se muestra negativo", axis=alt.Axis(format=",.2f")),
+                color=alt.Color("categoria:N", scale=color_scale, legend=alt.Legend(title="Serie")),
                 tooltip=[
-                    alt.Tooltip("periodo:N", title="Período"),
-                    alt.Tooltip("saldo_pagar:Q", title="Saldo (Σ)", format=",.2f"),
-                    alt.Tooltip("signo:N", title="Signo")
-                ],
+                    alt.Tooltip("casa:N", title="Casa"),
+                    alt.Tooltip("categoria:N", title="Serie"),
+                    alt.Tooltip("valor:Q", title="Valor (positivo/negativo)", format=",.2f"),
+                ]
             )
-            .properties(height=380)
+            .properties(height=420)
         )
 
         zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule().encode(y="y:Q")
+
         st.altair_chart(bars + zero_line, use_container_width=True)
 
         st.divider()
-        st.subheader("📌 Tabla (filtrada)")
-        st.dataframe(df_f.sort_values("fecha_pago", ascending=False), use_container_width=True)
+
+        # Tabla resumen por casa
+        st.subheader("📌 Resumen por Casa (filtrado)")
+        agg_out = agg.copy()
+        agg_out["monto_pagado_sum"] = agg_out["monto_pagado_sum"].round(2)
+        agg_out["saldo_pagar_sum"] = agg_out["saldo_pagar_sum"].round(2)
+        st.dataframe(agg_out.sort_values("casa"), use_container_width=True)
+
+        st.divider()
+        st.subheader("📄 Detalle (tabla filtrada)")
+        st.dataframe(df_f.sort_values(["casa", "fecha_pago"], ascending=[True, False]), use_container_width=True)
 
 
-# ------------------ Histórico ------------------
+# ------------------ HISTÓRICO ------------------
 elif menu == "Histórico":
     st.subheader("📚 Histórico (filtrado)")
 
@@ -250,7 +236,7 @@ elif menu == "Histórico":
         st.info("No hay datos para los filtros seleccionados.")
     else:
         st.caption(f"Registros filtrados: {len(df_f)}")
-        st.dataframe(df_f.sort_values("fecha_pago", ascending=False), use_container_width=True)
+        st.dataframe(df_f.sort_values(["casa", "fecha_pago"], ascending=[True, False]), use_container_width=True)
 
         csv_bytes = df_f.to_csv(index=False).encode("utf-8")
         st.download_button(
@@ -261,13 +247,12 @@ elif menu == "Histórico":
         )
 
 
-# ------------------ Administrador ------------------
+# ------------------ ADMINISTRADOR ------------------
 elif menu == "Administrador":
     st.subheader("🛠 Administrador")
 
     st.warning(
-        "Este botón ejecuta importar_datos.py. Si tu importador está configurado para borrar y recrear la base, "
-        "se reemplazarán los datos."
+        "Este botón ejecuta importar_datos.py para recargar la tabla pagos desde pagos_planos_2025.csv."
     )
 
     if st.sidebar.button("🚀 Ejecutar Carga Completa"):
@@ -295,7 +280,7 @@ elif menu == "Administrador":
         st.dataframe(df2.sort_values("fecha_pago", ascending=False).head(50), use_container_width=True)
 
 
-# ------------------ Logout ------------------
+# ------------------ LOGOUT ------------------
 st.sidebar.divider()
 if st.sidebar.button("Cerrar sesión"):
     st.session_state.conectado = False

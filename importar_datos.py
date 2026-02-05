@@ -3,13 +3,12 @@ import pandas as pd
 import sqlite3
 
 DB_PATH = "condominio.db"
+USUARIO_CARGA = "SISTEMA_CARGA"
 
 ARCHIVOS = [
     "012025.csv", "022025.csv", "032025.csv", "042025.csv", "052025.csv", "062025.csv",
     "072025.csv", "082025.csv", "092025.csv", "102025.csv", "112025.csv", "122025.csv"
 ]
-
-USUARIO_CARGA = "SISTEMA_CARGA"
 
 
 # ---------- Helpers ----------
@@ -23,6 +22,7 @@ def norm_cell(x) -> str:
 def money_to_float(x) -> float:
     if pd.isna(x):
         return 0.0
+
     s = str(x).strip()
 
     neg = False
@@ -38,12 +38,12 @@ def money_to_float(x) -> float:
     try:
         val = float(s)
         return -val if neg else val
-    except:
+    except Exception:
         return 0.0
 
 
 def parse_fecha(valor_fecha, archivo: str) -> str:
-    # Intenta leer fecha real
+    # 1) fecha real
     if not pd.isna(valor_fecha):
         s = norm_cell(valor_fecha)
         if s and s != "0":
@@ -51,7 +51,7 @@ def parse_fecha(valor_fecha, archivo: str) -> str:
             if pd.notna(dt):
                 return dt.strftime("%Y-%m-%d")
 
-    # Fallback: fecha primer día del mes según archivo MMYYYY.csv
+    # 2) fallback por nombre MMYYYY.csv
     m = re.search(r"(\d{2})(\d{4})", archivo)
     if m:
         mm = int(m.group(1))
@@ -86,7 +86,7 @@ def es_fila_pago_principal(descripcion: str) -> bool:
     if not s:
         return False
 
-    # Excluir sublíneas Provisión/Décimos/Sueldo
+    # Excluir sublíneas
     if "provisi" in s or "décim" in s or "decim" in s or "sueldo" in s:
         return False
 
@@ -101,11 +101,10 @@ def calcular_fondos(monto: float):
     return prov, deci, suel, oper
 
 
-# ---------- Overwrite por Casa+Mes ----------
 def borrar_mes_casa(cur, casa: str, mes_yyyy_mm: str):
     """
-    Borra registros previos de importación automática (SISTEMA_CARGA)
-    para esa casa y mes, y luego se reinsertan.
+    Overwrite: borra registros importados automáticamente (SISTEMA_CARGA)
+    de esa casa y ese mes; luego se inserta el nuevo.
     """
     cur.execute(
         """
@@ -127,7 +126,8 @@ def importar_historico_overwrite():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
 
-    total_insertados = 0
+    total_archivos = 0
+    total_reescritos = 0
 
     for archivo in ARCHIVOS:
         try:
@@ -139,15 +139,15 @@ def importar_historico_overwrite():
             col_fecha = cols[3]
             col_entra = cols[4]
 
-            # localizar bloque INGRESOS
+            # ubicar inicio bloque INGRESOS
             idx_ing = df.index[df[col_tipo].fillna("").astype(str).str.strip().eq("INGRESOS")]
             if len(idx_ing) == 0:
-                print(f"⚠️ No se encontró sección INGRESOS en {archivo}")
+                print(f"⚠️ {archivo}: no se encontró sección INGRESOS")
                 continue
 
             start = int(idx_ing[0])
 
-            # fin bloque INGRESOS
+            # ubicar fin bloque INGRESOS (evita 'nan' como texto)
             end = len(df)
             for i in range(start + 1, len(df)):
                 v = norm_cell(df.loc[i, col_tipo])
@@ -157,4 +157,47 @@ def importar_historico_overwrite():
 
             bloque = df.iloc[start:end].copy()
 
-            # Primero recolectamos filas “principal
+            filas = []
+            for _, row in bloque.iterrows():
+                desc = row.get(col_desc, "")
+                if not es_fila_pago_principal(desc):
+                    continue
+
+                casa = extraer_codigo_casa(desc)
+                if not casa:
+                    continue
+
+                fecha = parse_fecha(row.get(col_fecha, None), archivo)
+                mes = yyyymm(fecha)
+                monto = money_to_float(row.get(col_entra, 0))  # puede ser 0.0
+
+                filas.append((casa, fecha, mes, monto))
+
+            if not filas:
+                print(f"⚠️ {archivo}: no se detectaron casas para importar")
+                continue
+
+            # Overwrite por casa+mes
+            reescritos_arch = 0
+            for casa, fecha, mes, monto in filas:
+                borrar_mes_casa(cur, casa, mes)
+                prov, deci, suel, oper = calcular_fondos(monto)
+                cur.execute(insert_sql, (casa, fecha, monto, prov, deci, suel, oper, USUARIO_CARGA))
+                reescritos_arch += 1
+
+            conn.commit()
+            total_archivos += 1
+            total_reescritos += reescritos_arch
+            print(f"✅ {archivo}: reescritos={reescritos_arch}")
+
+        except FileNotFoundError:
+            print(f"❌ No existe el archivo: {archivo}")
+        except Exception as e:
+            print(f"❌ {archivo}: error -> {e}")
+
+    conn.close()
+    print(f"\nRESUMEN: archivos_procesados={total_archivos} | reescritos_total={total_reescritos}")
+
+
+if __name__ == "__main__":
+    importar_historico_overwrite()

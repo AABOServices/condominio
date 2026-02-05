@@ -9,12 +9,10 @@ import hashlib
 DB_PATH = "condominio.db"
 
 
-# ------------------ DB: esquema mínimo + usuarios ------------------
-def ensure_schema():
+# ------------------ DB: usuarios mínimos ------------------
+def ensure_users():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-
-    # usuarios
     cur.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             user TEXT PRIMARY KEY,
@@ -24,7 +22,6 @@ def ensure_schema():
     """)
     pw_hash = hashlib.sha256("admin123".encode()).hexdigest()
     cur.execute("INSERT OR IGNORE INTO usuarios VALUES ('admin', ?, 'ADMINISTRADOR')", (pw_hash,))
-
     conn.commit()
     conn.close()
 
@@ -45,7 +42,7 @@ def ejecutar_importacion_con_log(script_name="importar_datos.py"):
     return result.returncode, result.stdout, result.stderr
 
 
-# ------------------ Cargar datos ------------------
+# ------------------ Datos ------------------
 def cargar_df_pagos():
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -57,7 +54,7 @@ def cargar_df_pagos():
     if df.empty:
         return df
 
-    # Asegura columnas clave (por si cambia algo)
+    # columnas mínimas (defensivo)
     needed = ["casa", "propietario", "fecha_pago", "monto_pagado", "saldo_pagar"]
     for c in needed:
         if c not in df.columns:
@@ -65,18 +62,20 @@ def cargar_df_pagos():
 
     df["casa"] = df["casa"].fillna("").astype(str).str.strip().str.upper()
     df["propietario"] = df["propietario"].fillna("").astype(str).str.strip()
-
     df["fecha_pago"] = pd.to_datetime(df["fecha_pago"], errors="coerce")
 
-    for c in ["monto_pagado", "saldo_pagar"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["monto_pagado"] = pd.to_numeric(df["monto_pagado"], errors="coerce").fillna(0.0)
+    df["saldo_pagar"] = pd.to_numeric(df["saldo_pagar"], errors="coerce").fillna(0.0)
+
+    # periodo (para referencia)
+    df["periodo_mes"] = df["fecha_pago"].dt.to_period("M").astype(str)
 
     return df
 
 
 # ------------------ App ------------------
 st.set_page_config(page_title="Condominio 2025", layout="wide")
-ensure_schema()
+ensure_users()
 
 st.title("🏢 CONDOMINIOS NANTU")
 
@@ -109,7 +108,7 @@ st.sidebar.write(f"Rol: **{st.session_state.rol}**")
 
 menu = st.sidebar.radio("Menú", ["Dashboard", "Histórico", "Administrador"])
 
-# ------------------ Data ------------------
+# ------------------ Load data ------------------
 df = cargar_df_pagos()
 
 # ------------------ Filtros globales ------------------
@@ -126,7 +125,6 @@ if df.empty:
 else:
     casas = ["Todas"] + sorted([c for c in df["casa"].unique().tolist() if c])
     casa_sel = st.sidebar.selectbox("Casa", casas)
-
     prop_filter = st.sidebar.text_input("Propietario (contiene)", value="")
 
     min_fecha = df["fecha_pago"].min()
@@ -154,43 +152,61 @@ else:
 
 # ------------------ DASHBOARD ------------------
 if menu == "Dashboard":
-    st.subheader("📊 Dashboard por Casa (Pagado vs Saldo)")
+    st.subheader("📊 Dashboard por Casa (Pagado Σ vs Saldo último período)")
 
     if df_f.empty:
         st.info("No hay datos para mostrar con los filtros seleccionados.")
     else:
         # KPIs globales (filtrados)
         total_pagado = df_f["monto_pagado"].sum()
-        total_saldo = df_f["saldo_pagar"].sum()
+
+        # Saldo global: suma de saldos negativos del último período por casa
+        # (definimos primero el "último período" por fecha máxima dentro de df_f)
+        last_date = df_f["fecha_pago"].max()
+        last_period = last_date.to_period("M").strftime("%Y-%m") if pd.notna(last_date) else None
+
+        st.caption(f"Último período detectado (según filtros): **{last_period if last_period else 'N/D'}**")
+
+        # ---- Agregado por CASA ----
+        # 1) Pagado: suma total monto_pagado en el rango filtrado
+        pagado_by_casa = df_f.groupby("casa", as_index=False)["monto_pagado"].sum()
+        pagado_by_casa.rename(columns={"monto_pagado": "pagado_sum"}, inplace=True)
+
+        # 2) Saldo: tomar solo el saldo_pagar del ÚLTIMO período por casa (y solo si es negativo)
+        #    Regla: para cada casa, selecciona el registro con mayor fecha_pago (dentro de filtros)
+        df_last = df_f.dropna(subset=["fecha_pago"]).sort_values(["casa", "fecha_pago"])
+        idx = df_last.groupby("casa")["fecha_pago"].idxmax()
+        last_rows = df_last.loc[idx, ["casa", "fecha_pago", "saldo_pagar"]].copy()
+
+        # saldo negativo únicamente
+        last_rows["saldo_ultimo_neg"] = last_rows["saldo_pagar"].apply(lambda x: x if x < 0 else 0.0)
+
+        saldo_by_casa = last_rows[["casa", "saldo_ultimo_neg", "fecha_pago"]].copy()
+
+        # merge
+        agg = pd.merge(pagado_by_casa, saldo_by_casa, on="casa", how="left")
+        agg["saldo_ultimo_neg"] = agg["saldo_ultimo_neg"].fillna(0.0)
+
+        # KPIs: saldo total (negativo) sumado por casa
+        total_saldo_ultimo_neg = agg["saldo_ultimo_neg"].sum()
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Monto Pagado (Σ)", f"${total_pagado:,.2f}")
-        c2.metric("Saldo por Pagar (Σ)", f"${total_saldo:,.2f}")
+        c2.metric("Saldo último período (Σ negativos)", f"${total_saldo_ultimo_neg:,.2f}")
         c3.metric("Registros (filtrados)", f"{len(df_f)}")
 
         st.divider()
 
-        # Agregado por CASA
-        agg = df_f.groupby(["casa"], as_index=False).agg(
-            monto_pagado_sum=("monto_pagado", "sum"),
-            saldo_pagar_sum=("saldo_pagar", "sum"),
-        )
-
-        # Construimos formato "long" para el chart:
-        # - Pagado (positivo)
-        # - Saldo por pagar (negativo)
+        # Construir df “long” para chart:
         rows = []
         for _, r in agg.iterrows():
-            rows.append({"casa": r["casa"], "categoria": "Pagado", "valor": float(r["monto_pagado_sum"])})
-            rows.append({"casa": r["casa"], "categoria": "Saldo por pagar", "valor": -float(r["saldo_pagar_sum"])})
+            rows.append({"casa": r["casa"], "categoria": "Pagado (Σ)", "valor": float(r["pagado_sum"])})
+            rows.append({"casa": r["casa"], "categoria": "Saldo (último período, solo <0)", "valor": float(r["saldo_ultimo_neg"])})
 
         chart_df = pd.DataFrame(rows)
 
-        # Colores requeridos: positivo verde, negativo anaranjado
-        # OJO: aquí el color lo definimos por categoría (Pagado vs Saldo por pagar),
-        # porque el signo ya va por el valor (+ / -)
         color_scale = alt.Scale(
-            domain=["Pagado", "Saldo por pagar"],
+            domain=["Pagado (Σ)", "Saldo (último período, solo <0)"],
             range=["#2e7d32", "#ef6c00"]  # verde / anaranjado
         )
 
@@ -204,23 +220,26 @@ if menu == "Dashboard":
                 tooltip=[
                     alt.Tooltip("casa:N", title="Casa"),
                     alt.Tooltip("categoria:N", title="Serie"),
-                    alt.Tooltip("valor:Q", title="Valor (positivo/negativo)", format=",.2f"),
-                ]
+                    alt.Tooltip("valor:Q", title="Valor", format=",.2f"),
+                ],
             )
             .properties(height=420)
         )
 
         zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule().encode(y="y:Q")
-
         st.altair_chart(bars + zero_line, use_container_width=True)
 
         st.divider()
 
-        # Tabla resumen por casa
         st.subheader("📌 Resumen por Casa (filtrado)")
         agg_out = agg.copy()
-        agg_out["monto_pagado_sum"] = agg_out["monto_pagado_sum"].round(2)
-        agg_out["saldo_pagar_sum"] = agg_out["saldo_pagar_sum"].round(2)
+        agg_out["pagado_sum"] = agg_out["pagado_sum"].round(2)
+        agg_out["saldo_ultimo_neg"] = agg_out["saldo_ultimo_neg"].round(2)
+        agg_out.rename(columns={
+            "pagado_sum": "monto_pagado_sum",
+            "saldo_ultimo_neg": "saldo_ultimo_periodo_neg",
+            "fecha_pago": "fecha_ultimo_registro"
+        }, inplace=True)
         st.dataframe(agg_out.sort_values("casa"), use_container_width=True)
 
         st.divider()
@@ -251,9 +270,7 @@ elif menu == "Histórico":
 elif menu == "Administrador":
     st.subheader("🛠 Administrador")
 
-    st.warning(
-        "Este botón ejecuta importar_datos.py para recargar la tabla pagos desde pagos_planos_2025.csv."
-    )
+    st.warning("Este botón ejecuta importar_datos.py para recargar la tabla pagos desde pagos_planos_2025.csv.")
 
     if st.sidebar.button("🚀 Ejecutar Carga Completa"):
         returncode, stdout, stderr = ejecutar_importacion_con_log("importar_datos.py")

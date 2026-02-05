@@ -1,44 +1,28 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import hashlib
 import subprocess
 import sys
+import altair as alt
+import hashlib
 
 DB_PATH = "condominio.db"
 
 
-# ------------------ DB ------------------
-def init_db():
+# ------------------ DB helpers ------------------
+def ensure_users_table():
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS pagos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            casa TEXT,
-            fecha TEXT,
-            monto REAL,
-            provision REAL,
-            decimos REAL,
-            sueldo REAL,
-            operativo REAL,
-            usuario TEXT
-        )"""
-    )
-
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS usuarios (
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios (
             user TEXT PRIMARY KEY,
             pw TEXT,
             rol TEXT
-        )"""
-    )
-
-    # Usuario por defecto: admin / clave: admin123
+        )
+    """)
+    # admin/admin123 por defecto
     pw_hash = hashlib.sha256("admin123".encode()).hexdigest()
-    c.execute("INSERT OR IGNORE INTO usuarios VALUES ('admin', ?, 'ADMINISTRADOR')", (pw_hash,))
-
+    cur.execute("INSERT OR IGNORE INTO usuarios VALUES ('admin', ?, 'ADMINISTRADOR')", (pw_hash,))
     conn.commit()
     conn.close()
 
@@ -54,42 +38,26 @@ def validar_login(user: str, pw: str) -> bool:
     return False
 
 
-def calcular_fondos(monto: float):
-    prov = round(monto * 0.0338, 2)
-    deci = round(monto * 0.045, 2)
-    suel = round(monto * 0.20, 2)
-    oper = round(monto - prov - deci - suel, 2)
-    return prov, deci, suel, oper
-
-
-def guardar_pago(casa: str, fecha: str, monto: float, usuario: str):
-    p, d, s, o = calcular_fondos(monto)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """INSERT INTO pagos (casa, fecha, monto, provision, decimos, sueldo, operativo, usuario)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (casa, fecha, monto, p, d, s, o, usuario),
-    )
-    conn.commit()
-    conn.close()
-    return p, d, s, o
-
-
 def cargar_df_pagos():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM pagos", conn)
+    try:
+        df = pd.read_sql_query("SELECT * FROM pagos", conn)
+    except Exception:
+        df = pd.DataFrame()
     conn.close()
 
     if not df.empty:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        # Normaliza fecha_pago
+        df["fecha_pago"] = pd.to_datetime(df["fecha_pago"], errors="coerce")
+        # Asegura columnas numéricas
+        for c in ["monto_a_pagar", "monto_pagado", "provision", "decimos", "sueldo", "saldo_pagar"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
     return df
 
 
 def ejecutar_importacion_con_log(script_name="importar_datos.py"):
-    """
-    Ejecuta el script de importación y devuelve stdout/stderr/returncode para visualizar en Streamlit.
-    """
     result = subprocess.run(
         [sys.executable, script_name],
         capture_output=True,
@@ -98,13 +66,13 @@ def ejecutar_importacion_con_log(script_name="importar_datos.py"):
     return result.returncode, result.stdout, result.stderr
 
 
-# ------------------ UI ------------------
+# ------------------ App setup ------------------
 st.set_page_config(page_title="Condominio 2025", layout="wide")
-init_db()
+ensure_users_table()
 
 st.title("🏢 CONDOMINIOS NANTU")
 
-# Session State
+# Session state
 if "conectado" not in st.session_state:
     st.session_state.conectado = False
 if "user" not in st.session_state:
@@ -127,143 +95,190 @@ if not st.session_state.conectado:
         else:
             st.sidebar.error("Error de acceso (usuario/clave incorrectos)")
 
-    st.info("Ingresa con tus credenciales para gestionar pagos, histórico y dashboard.")
+    st.info("Ingresa con tus credenciales para visualizar el dashboard e históricos.")
     st.stop()
 
-
-# ------------------ APP ------------------
 st.sidebar.success(f"Conectado como: {st.session_state.user}")
 st.sidebar.write(f"Rol: **{st.session_state.rol}**")
 
-menu = st.sidebar.radio("Menú", ["Dashboard", "Cargar Pago", "Histórico", "Administrador"])
+menu = st.sidebar.radio("Menú", ["Dashboard", "Histórico", "Administrador"])
 
+# ------------------ Load data once ------------------
+df = cargar_df_pagos()
 
-# ------------------ ADMIN ------------------
-if menu == "Administrador":
-    st.subheader("🛠 Administración del Sistema")
+# ------------------ Shared filters (aplican a TODO) ------------------
+st.sidebar.divider()
+st.sidebar.subheader("🎛️ Filtros (globales)")
 
-    st.warning(
-        "⚠️ Si ya cargaste históricos una vez, no repitas sin control de duplicados. "
-        "Ahora te muestro el log real para saber por qué falló."
-    )
+if df.empty:
+    st.sidebar.info("Aún no hay datos en la tabla 'pagos'.")
+    casa_sel = "Todas"
+    prop_filter = ""
+    f_ini = None
+    f_fin = None
+    df_f = df
+else:
+    casas = ["Todas"] + sorted(df["casa"].dropna().unique().tolist())
+    casa_sel = st.sidebar.selectbox("Casa", casas)
 
-    if st.sidebar.button("🚀 Ejecutar Carga Histórica"):
-        returncode, stdout, stderr = ejecutar_importacion_con_log("importar_datos.py")
+    propietarios = sorted(df["propietario"].dropna().unique().tolist())
+    prop_filter = st.sidebar.text_input("Propietario (contiene)", value="")
 
-        st.write("### Resultado de ejecución")
-        st.write("**Return code:**", returncode)
+    min_fecha = df["fecha_pago"].min()
+    max_fecha = df["fecha_pago"].max()
 
-        if stdout:
-            st.write("**STDOUT:**")
-            st.code(stdout, language="text")
-        else:
-            st.write("**STDOUT:** (vacío)")
+    colf1, colf2 = st.sidebar.columns(2)
+    with colf1:
+        f_ini = st.date_input("Desde", value=min_fecha.date() if pd.notna(min_fecha) else None)
+    with colf2:
+        f_fin = st.date_input("Hasta", value=max_fecha.date() if pd.notna(max_fecha) else None)
 
-        if stderr:
-            st.write("**STDERR:**")
-            st.code(stderr, language="text")
-        else:
-            st.write("**STDERR:** (vacío)")
+    df_f = df.copy()
 
-        if returncode == 0:
-            st.success("✅ Carga histórica OK. Ve a Histórico/Dashboard.")
-        else:
-            st.error("❌ La carga falló. Revisa el STDERR arriba (ahí está el motivo real).")
+    if casa_sel != "Todas":
+        df_f = df_f[df_f["casa"] == casa_sel]
 
-    st.divider()
-    df = cargar_df_pagos()
-    st.write(f"Registros en base: **{len(df)}**")
-    if not df.empty:
-        st.dataframe(df.sort_values("fecha", ascending=False).head(50), use_container_width=True)
+    if prop_filter.strip():
+        df_f = df_f[df_f["propietario"].str.contains(prop_filter.strip(), case=False, na=False)]
 
-
-# ------------------ CARGAR PAGO ------------------
-elif menu == "Cargar Pago":
-    st.subheader("📝 Registrar nuevo ingreso")
-
-    casa = st.selectbox("Seleccione Casa", [f"C{i:02d}" for i in range(1, 11)])
-    monto = st.number_input("Monto Recibido ($)", min_value=0.0, step=0.01)
-    fecha = st.date_input("Fecha del depósito")
-
-    if st.button("Guardar Registro"):
-        p, d, s, o = guardar_pago(casa, str(fecha), float(monto), st.session_state.user)
-        st.success(f"¡Guardado! Provisión: ${p} | Décimos: ${d} | Sueldo: ${s} | Operativo: ${o}")
+    if f_ini and f_fin:
+        df_f = df_f[
+            (df_f["fecha_pago"].dt.date >= f_ini) &
+            (df_f["fecha_pago"].dt.date <= f_fin)
+        ]
 
 
 # ------------------ DASHBOARD ------------------
-elif menu == "Dashboard":
-    st.subheader("📊 Resumen General")
+if menu == "Dashboard":
+    st.subheader("📊 Dashboard (filtrado)")
 
-    df = cargar_df_pagos()
-
-    if df.empty:
-        st.info("Aún no hay datos.")
+    if df_f.empty:
+        st.info("No hay datos para los filtros seleccionados.")
     else:
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Total Recaudado", f"${df['monto'].sum():,.2f}")
-        col2.metric("Provisión", f"${df['provision'].sum():,.2f}")
-        col3.metric("Décimos", f"${df['decimos'].sum():,.2f}")
-        col4.metric("Sueldo", f"${df['sueldo'].sum():,.2f}")
-        col5.metric("Operativo", f"${df['operativo'].sum():,.2f}")
+        # KPIs
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Monto a pagar (Σ)", f"${df_f['monto_a_pagar'].sum():,.2f}")
+        c2.metric("Monto pagado (Σ)", f"${df_f['monto_pagado'].sum():,.2f}")
+        c3.metric("Saldo a pagar (Σ)", f"${df_f['saldo_pagar'].sum():,.2f}")
+        c4.metric("Registros", f"{len(df_f)}")
 
         st.divider()
-        st.subheader("Ingresos por Casa")
-        por_casa = df.groupby("casa")["monto"].sum().sort_index()
-        st.bar_chart(por_casa)
+
+        # Histograma / barras por período (mes) del saldo
+        df_chart = df_f.copy()
+        df_chart["periodo"] = df_chart["fecha_pago"].dt.to_period("M").astype(str)
+        df_agg = df_chart.groupby("periodo", as_index=False)["saldo_pagar"].sum()
+        df_agg["signo"] = df_agg["saldo_pagar"].apply(lambda x: "Positivo" if x >= 0 else "Negativo")
+
+        # Colores requeridos
+        color_scale = alt.Scale(
+            domain=["Positivo", "Negativo"],
+            range=["#2e7d32", "#ef6c00"]  # verde / anaranjado
+        )
+
+        chart = (
+            alt.Chart(df_agg)
+            .mark_bar()
+            .encode(
+                x=alt.X("periodo:N", title="Período (YYYY-MM)", sort=None),
+                y=alt.Y("saldo_pagar:Q", title="Saldo a pagar (Σ)", axis=alt.Axis(format=",.2f")),
+                color=alt.Color("signo:N", scale=color_scale, legend=alt.Legend(title="Signo")),
+                tooltip=[
+                    alt.Tooltip("periodo:N", title="Período"),
+                    alt.Tooltip("saldo_pagar:Q", title="Saldo (Σ)", format=",.2f"),
+                    alt.Tooltip("signo:N", title="Signo")
+                ],
+            )
+            .properties(height=380)
+        )
+
+        # Línea 0 para enfatizar negativos hacia abajo
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule().encode(y="y:Q")
+
+        st.altair_chart(chart + zero_line, use_container_width=True)
 
         st.divider()
-        st.subheader("Últimos movimientos")
-        st.dataframe(df.sort_values("fecha", ascending=False).head(30), use_container_width=True)
+
+        # Resumen por casa (si no está filtrado por una casa)
+        if casa_sel == "Todas":
+            st.subheader("Resumen por Casa (Saldo Σ)")
+            df_casa = df_f.groupby("casa", as_index=False)["saldo_pagar"].sum()
+            df_casa["signo"] = df_casa["saldo_pagar"].apply(lambda x: "Positivo" if x >= 0 else "Negativo")
+
+            chart2 = (
+                alt.Chart(df_casa)
+                .mark_bar()
+                .encode(
+                    x=alt.X("casa:N", title="Casa", sort="ascending"),
+                    y=alt.Y("saldo_pagar:Q", title="Saldo a pagar (Σ)", axis=alt.Axis(format=",.2f")),
+                    color=alt.Color("signo:N", scale=color_scale, legend=None),
+                    tooltip=[
+                        alt.Tooltip("casa:N", title="Casa"),
+                        alt.Tooltip("saldo_pagar:Q", title="Saldo (Σ)", format=",.2f"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart2 + zero_line, use_container_width=True)
+
+        st.divider()
+        st.subheader("📌 Tabla (filtrada)")
+        st.dataframe(
+            df_f.sort_values("fecha_pago", ascending=False),
+            use_container_width=True
+        )
 
 
 # ------------------ HISTÓRICO ------------------
 elif menu == "Histórico":
-    st.subheader("📚 Histórico de Pagos (Cargados + Manuales)")
+    st.subheader("📚 Histórico (filtrado)")
 
-    df = cargar_df_pagos()
-
-    if df.empty:
-        st.info("No hay registros aún. Ve a Administrador para cargar históricos o registra un pago.")
+    if df_f.empty:
+        st.info("No hay datos para los filtros seleccionados.")
     else:
-        casas = ["Todas"] + sorted(df["casa"].dropna().unique().tolist())
-        casa_sel = st.selectbox("Filtrar por Casa", casas)
-
-        min_fecha = df["fecha"].min()
-        max_fecha = df["fecha"].max()
-
-        colf1, colf2 = st.columns(2)
-        with colf1:
-            f_ini = st.date_input("Desde", value=min_fecha.date() if pd.notna(min_fecha) else None)
-        with colf2:
-            f_fin = st.date_input("Hasta", value=max_fecha.date() if pd.notna(max_fecha) else None)
-
-        df_f = df.copy()
-
-        if casa_sel != "Todas":
-            df_f = df_f[df_f["casa"] == casa_sel]
-
-        if f_ini and f_fin:
-            df_f = df_f[(df_f["fecha"].dt.date >= f_ini) & (df_f["fecha"].dt.date <= f_fin)]
-
         st.caption(f"Registros filtrados: {len(df_f)}")
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Monto", f"${df_f['monto'].sum():,.2f}")
-        c2.metric("Provisión", f"${df_f['provision'].sum():,.2f}")
-        c3.metric("Décimos", f"${df_f['decimos'].sum():,.2f}")
-        c4.metric("Sueldo", f"${df_f['sueldo'].sum():,.2f}")
-        c5.metric("Operativo", f"${df_f['operativo'].sum():,.2f}")
-
-        st.divider()
-        st.dataframe(df_f.sort_values("fecha", ascending=False), use_container_width=True)
+        st.dataframe(df_f.sort_values("fecha_pago", ascending=False), use_container_width=True)
 
         csv_bytes = df_f.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Descargar CSV (filtrado)",
             data=csv_bytes,
             file_name="historico_filtrado.csv",
-            mime="text/csv",
+            mime="text/csv"
         )
+
+
+# ------------------ ADMINISTRADOR ------------------
+elif menu == "Administrador":
+    st.subheader("🛠 Administrador")
+
+    st.warning(
+        "Este proceso ejecuta importar_datos.py. "
+        "Si tu importador está configurado para BORRAR y RECREAR la base, se perderán datos previos."
+    )
+
+    if st.sidebar.button("🚀 Ejecutar Carga Completa (recrear BD)"):
+        returncode, stdout, stderr = ejecutar_importacion_con_log("importar_datos.py")
+
+        st.write("### Resultado de ejecución")
+        st.write("**Return code:**", returncode)
+
+        st.write("**STDOUT:**")
+        st.code(stdout if stdout else "(vacío)", language="text")
+
+        st.write("**STDERR:**")
+        st.code(stderr if stderr else "(vacío)", language="text")
+
+        if returncode == 0:
+            st.success("✅ Carga completa OK. Recarga la página o ve a Dashboard/Histórico.")
+        else:
+            st.error("❌ La carga falló. Revisa el STDERR (motivo real).")
+
+    st.divider()
+    df2 = cargar_df_pagos()
+    st.write(f"Registros en base: **{len(df2)}**")
+    if not df2.empty:
+        st.dataframe(df2.sort_values("fecha_pago", ascending=False).head(50), use_container_width=True)
 
 
 # ------------------ LOGOUT ------------------

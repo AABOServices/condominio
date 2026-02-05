@@ -37,7 +37,7 @@ def validar_login(user: str, pw: str) -> bool:
     return False
 
 
-def ejecutar_importacion_con_log(script_name="importar_datos.py"):
+def run_script(script_name: str):
     result = subprocess.run([sys.executable, script_name], capture_output=True, text=True)
     return result.returncode, result.stdout, result.stderr
 
@@ -65,18 +65,31 @@ def cargar_df_pagos():
 
     df["monto_pagado"] = pd.to_numeric(df["monto_pagado"], errors="coerce").fillna(0.0)
     df["saldo_pagar"] = pd.to_numeric(df["saldo_pagar"], errors="coerce").fillna(0.0)
-
     df["periodo_mes"] = df["fecha_pago"].dt.to_period("M").astype(str)
 
+    return df
+
+
+def cargar_df_propietarios():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query("SELECT * FROM propietarios", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+
+    if not df.empty:
+        df["casa"] = df["casa"].astype(str).str.strip().str.upper()
+        df["propietario"] = df["propietario"].astype(str).str.strip()
     return df
 
 
 # ------------------ App ------------------
 st.set_page_config(page_title="Condominio 2025", layout="wide")
 ensure_users()
-
 st.title("🏢 CONDOMINIOS NANTU")
 
+# session
 if "conectado" not in st.session_state:
     st.session_state.conectado = False
 if "user" not in st.session_state:
@@ -96,21 +109,20 @@ if not st.session_state.conectado:
             st.rerun()
         else:
             st.sidebar.error("Error de acceso (usuario/clave incorrectos)")
-
     st.info("Ingresa con tus credenciales para visualizar dashboard, históricos y administración.")
     st.stop()
 
 st.sidebar.success(f"Conectado como: {st.session_state.user}")
 st.sidebar.write(f"Rol: **{st.session_state.rol}**")
 
-menu = st.sidebar.radio("Menú", ["Dashboard", "Histórico", "Administrador"])
+menu = st.sidebar.radio("Menú", ["Dashboard", "Histórico", "Propietarios", "Administrador"])
 
 # ------------------ Load data ------------------
 df = cargar_df_pagos()
 
-# ------------------ Filtros globales ------------------
+# ------------------ Filtros globales (afectan pagos) ------------------
 st.sidebar.divider()
-st.sidebar.subheader("🎛️ Filtros (globales)")
+st.sidebar.subheader("🎛️ Filtros (Pagos)")
 
 if df.empty:
     st.sidebar.info("No hay datos. Ejecuta la carga desde 'Administrador'.")
@@ -133,18 +145,12 @@ else:
         f_fin = st.date_input("Hasta", value=max_fecha.date() if pd.notna(max_fecha) else None)
 
     df_f = df.copy()
-
     if casa_sel != "Todas":
         df_f = df_f[df_f["casa"] == casa_sel]
-
     if prop_filter.strip():
         df_f = df_f[df_f["propietario"].str.contains(prop_filter.strip(), case=False, na=False)]
-
     if f_ini and f_fin:
-        df_f = df_f[
-            (df_f["fecha_pago"].dt.date >= f_ini) &
-            (df_f["fecha_pago"].dt.date <= f_fin)
-        ]
+        df_f = df_f[(df_f["fecha_pago"].dt.date >= f_ini) & (df_f["fecha_pago"].dt.date <= f_fin)]
 
 
 # ------------------ DASHBOARD ------------------
@@ -156,32 +162,33 @@ if menu == "Dashboard":
     else:
         total_pagado = df_f["monto_pagado"].sum()
 
-        last_date = df_f["fecha_pago"].max()
-        last_period = last_date.to_period("M").strftime("%Y-%m") if pd.notna(last_date) else None
-        st.caption(f"Último período detectado (según filtros): **{last_period if last_period else 'N/D'}**")
-
-        # 1) Pagado: suma en rango filtrado
+        # Pagado Σ por casa
         pagado_by_casa = df_f.groupby("casa", as_index=False)["monto_pagado"].sum()
         pagado_by_casa.rename(columns={"monto_pagado": "pagado_sum"}, inplace=True)
 
-        # 2) Último saldo por casa (según fecha máxima de cada casa dentro de filtros)
+        # Último saldo por casa según fecha máxima en el filtro
         df_last = df_f.dropna(subset=["fecha_pago"]).sort_values(["casa", "fecha_pago"])
         idx = df_last.groupby("casa")["fecha_pago"].idxmax()
         last_rows = df_last.loc[idx, ["casa", "fecha_pago", "saldo_pagar"]].copy()
 
-        # series separadas según signo
         last_rows["saldo_ultimo_neg"] = last_rows["saldo_pagar"].apply(lambda x: x if x < 0 else 0.0)
         last_rows["saldo_ultimo_pos"] = last_rows["saldo_pagar"].apply(lambda x: x if x > 0 else 0.0)
 
-        saldo_by_casa = last_rows[["casa", "fecha_pago", "saldo_ultimo_neg", "saldo_ultimo_pos"]].copy()
-
-        # merge
-        agg = pd.merge(pagado_by_casa, saldo_by_casa, on="casa", how="left")
+        agg = pd.merge(
+            pagado_by_casa,
+            last_rows[["casa", "fecha_pago", "saldo_ultimo_neg", "saldo_ultimo_pos"]],
+            on="casa",
+            how="left"
+        )
         agg["saldo_ultimo_neg"] = agg["saldo_ultimo_neg"].fillna(0.0)
         agg["saldo_ultimo_pos"] = agg["saldo_ultimo_pos"].fillna(0.0)
 
         total_saldo_neg = agg["saldo_ultimo_neg"].sum()
         total_saldo_pos = agg["saldo_ultimo_pos"].sum()
+
+        last_date = df_f["fecha_pago"].max()
+        last_period = last_date.to_period("M").strftime("%Y-%m") if pd.notna(last_date) else None
+        st.caption(f"Último período detectado (según filtros): **{last_period if last_period else 'N/D'}**")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Monto Pagado (Σ)", f"${total_pagado:,.2f}")
@@ -191,7 +198,7 @@ if menu == "Dashboard":
 
         st.divider()
 
-        # Datos para chart (long)
+        # Long format para chart
         rows = []
         for _, r in agg.iterrows():
             rows.append({"casa": r["casa"], "categoria": "Pagado (Σ)", "valor": float(r["pagado_sum"])})
@@ -200,10 +207,9 @@ if menu == "Dashboard":
 
         chart_df = pd.DataFrame(rows)
 
-        # Colores: verde, anaranjado, morado
         color_scale = alt.Scale(
             domain=["Pagado (Σ)", "Saldo negativo (último, <0)", "Saldo positivo (último, >0)"],
-            range=["#2e7d32", "#ef6c00", "#6a1b9a"]
+            range=["#2e7d32", "#ef6c00", "#6a1b9a"]  # verde / anaranjado / morado
         )
 
         bars = (
@@ -224,23 +230,6 @@ if menu == "Dashboard":
 
         zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule().encode(y="y:Q")
         st.altair_chart(bars + zero_line, use_container_width=True)
-
-        st.divider()
-
-        st.subheader("📌 Resumen por Casa (filtrado)")
-        agg_out = agg.copy()
-        agg_out["pagado_sum"] = agg_out["pagado_sum"].round(2)
-        agg_out["saldo_ultimo_neg"] = agg_out["saldo_ultimo_neg"].round(2)
-        agg_out["saldo_ultimo_pos"] = agg_out["saldo_ultimo_pos"].round(2)
-
-        agg_out.rename(columns={
-            "pagado_sum": "monto_pagado_sum",
-            "saldo_ultimo_neg": "saldo_ultimo_periodo_neg",
-            "saldo_ultimo_pos": "saldo_ultimo_periodo_pos",
-            "fecha_pago": "fecha_ultimo_registro"
-        }, inplace=True)
-
-        st.dataframe(agg_out.sort_values("casa"), use_container_width=True)
 
         st.divider()
         st.subheader("📄 Detalle (tabla filtrada)")
@@ -266,35 +255,79 @@ elif menu == "Histórico":
         )
 
 
+# ------------------ PROPIETARIOS ------------------
+elif menu == "Propietarios":
+    st.subheader("🏠 Maestro de Propietarios por Casa")
+
+    dfp = cargar_df_propietarios()
+    if dfp.empty:
+        st.warning("No existe la tabla 'propietarios' o está vacía. Ve a 'Administrador' y ejecuta 'Actualizar Propietarios'.")
+    else:
+        # filtros propios de esta vista
+        c1, c2 = st.columns(2)
+        with c1:
+            casa_p = st.selectbox("Casa", ["Todas"] + sorted(dfp["casa"].unique().tolist()))
+        with c2:
+            q = st.text_input("Buscar propietario (contiene)", value="")
+
+        dfp_f = dfp.copy()
+        if casa_p != "Todas":
+            dfp_f = dfp_f[dfp_f["casa"] == casa_p]
+        if q.strip():
+            dfp_f = dfp_f[dfp_f["propietario"].str.contains(q.strip(), case=False, na=False)]
+
+        st.dataframe(dfp_f.sort_values("casa"), use_container_width=True)
+
+        csv_bytes = dfp_f.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Descargar Propietarios (filtrado)",
+            data=csv_bytes,
+            file_name="propietarios_filtrado.csv",
+            mime="text/csv"
+        )
+
+
 # ------------------ ADMINISTRADOR ------------------
 elif menu == "Administrador":
     st.subheader("🛠 Administrador")
 
-    st.warning("Este botón ejecuta importar_datos.py para recargar la tabla pagos desde pagos_planos_2025.csv.")
+    st.warning("Acciones de carga/actualización de base de datos.")
 
-    if st.sidebar.button("🚀 Ejecutar Carga Completa"):
-        returncode, stdout, stderr = ejecutar_importacion_con_log("importar_datos.py")
+    colA, colB = st.columns(2)
 
-        st.write("### Resultado de ejecución")
-        st.write("**Return code:**", returncode)
+    with colA:
+        if st.button("🚀 Ejecutar Carga Pagos (importar_datos.py)"):
+            rc, out, err = run_script("importar_datos.py")
+            st.write("**Return code:**", rc)
+            st.code(out if out else "(stdout vacío)", language="text")
+            st.code(err if err else "(stderr vacío)", language="text")
+            if rc == 0:
+                st.success("✅ Pagos cargados correctamente.")
+            else:
+                st.error("❌ Error en la carga de pagos. Revisa stderr.")
 
-        st.write("**STDOUT:**")
-        st.code(stdout if stdout else "(vacío)", language="text")
-
-        st.write("**STDERR:**")
-        st.code(stderr if stderr else "(vacío)", language="text")
-
-        if returncode == 0:
-            st.success("✅ Carga completa OK. Ve a Dashboard/Histórico.")
-            st.info("Si no ves cambios, recarga la página (F5).")
-        else:
-            st.error("❌ La carga falló. Revisa el STDERR (motivo real).")
+    with colB:
+        if st.button("🏠 Actualizar Propietarios (propietarios_db.py)"):
+            rc, out, err = run_script("propietarios_db.py")
+            st.write("**Return code:**", rc)
+            st.code(out if out else "(stdout vacío)", language="text")
+            st.code(err if err else "(stderr vacío)", language="text")
+            if rc == 0:
+                st.success("✅ Propietarios actualizados correctamente.")
+            else:
+                st.error("❌ Error al actualizar propietarios. Revisa stderr.")
 
     st.divider()
+    st.subheader("Vista rápida")
     df2 = cargar_df_pagos()
-    st.write(f"Registros en base: **{len(df2)}**")
+    st.write(f"Registros en pagos: **{len(df2)}**")
     if not df2.empty:
-        st.dataframe(df2.sort_values("fecha_pago", ascending=False).head(50), use_container_width=True)
+        st.dataframe(df2.sort_values("fecha_pago", ascending=False).head(20), use_container_width=True)
+
+    dfp2 = cargar_df_propietarios()
+    st.write(f"Registros en propietarios: **{len(dfp2)}**")
+    if not dfp2.empty:
+        st.dataframe(dfp2.sort_values("casa").head(20), use_container_width=True)
 
 
 # ------------------ LOGOUT ------------------
@@ -304,4 +337,5 @@ if st.sidebar.button("Cerrar sesión"):
     st.session_state.user = ""
     st.session_state.rol = ""
     st.rerun()
+
 

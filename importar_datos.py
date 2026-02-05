@@ -10,6 +10,9 @@ ARCHIVOS = [
     "072025.csv", "082025.csv", "092025.csv", "102025.csv", "112025.csv", "122025.csv"
 ]
 
+# Si True: también reescribe cuando monto==0 (peligroso si tu CSV no trae ENTRA completo)
+FORZAR_REESCRITURA_CON_CERO = False
+
 
 # ---------- Helpers ----------
 def norm_cell(x) -> str:
@@ -19,10 +22,31 @@ def norm_cell(x) -> str:
     return "" if s.lower() == "nan" else s
 
 
+def normalize_colname(s: str) -> str:
+    """Normaliza nombre de columna para matching (sin acentos básicos, minúsculas)."""
+    s = norm_cell(s).lower()
+    s = s.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+    s = s.replace("ñ", "n")
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def find_col(cols, candidates):
+    """
+    Busca una columna cuyo nombre contenga alguna de las cadenas en candidates (ya normalizadas).
+    """
+    norm_map = {c: normalize_colname(c) for c in cols}
+    for cand in candidates:
+        cand_n = normalize_colname(cand)
+        for original, normed in norm_map.items():
+            if cand_n in normed:
+                return original
+    return None
+
+
 def money_to_float(x) -> float:
     if pd.isna(x):
         return 0.0
-
     s = str(x).strip()
 
     neg = False
@@ -43,15 +67,14 @@ def money_to_float(x) -> float:
 
 
 def parse_fecha(valor_fecha, archivo: str) -> str:
-    # 1) fecha real
-    if not pd.isna(valor_fecha):
-        s = norm_cell(valor_fecha)
-        if s and s != "0":
-            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-            if pd.notna(dt):
-                return dt.strftime("%Y-%m-%d")
+    # fecha real si existe
+    s = norm_cell(valor_fecha)
+    if s and s != "0":
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.notna(dt):
+            return dt.strftime("%Y-%m-%d")
 
-    # 2) fallback por nombre MMYYYY.csv
+    # fallback por archivo MMYYYY.csv
     m = re.search(r"(\d{2})(\d{4})", archivo)
     if m:
         mm = int(m.group(1))
@@ -85,11 +108,8 @@ def es_fila_pago_principal(descripcion: str) -> bool:
     s = norm_cell(descripcion).lower()
     if not s:
         return False
-
-    # Excluir sublíneas
     if "provisi" in s or "décim" in s or "decim" in s or "sueldo" in s:
         return False
-
     return bool(re.match(r"^(c\d{2}|\d{2})\b", s))
 
 
@@ -102,10 +122,6 @@ def calcular_fondos(monto: float):
 
 
 def borrar_mes_casa(cur, casa: str, mes_yyyy_mm: str):
-    """
-    Overwrite: borra registros importados automáticamente (SISTEMA_CARGA)
-    de esa casa y ese mes; luego se inserta el nuevo.
-    """
     cur.execute(
         """
         DELETE FROM pagos
@@ -117,7 +133,8 @@ def borrar_mes_casa(cur, casa: str, mes_yyyy_mm: str):
     )
 
 
-def importar_historico_overwrite():
+# ---------- Importación ----------
+def importar_historico_overwrite_seguro():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -126,20 +143,21 @@ def importar_historico_overwrite():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
 
-    total_archivos = 0
     total_reescritos = 0
+    total_saltados_por_cero = 0
 
     for archivo in ARCHIVOS:
         try:
             df = pd.read_csv(archivo, skiprows=2, encoding="latin1")
             cols = list(df.columns)
 
-            col_tipo = cols[0]
-            col_desc = cols[1]
-            col_fecha = cols[3]
-            col_entra = cols[4]
+            # Detectar columnas por nombre (robusto)
+            col_tipo = find_col(cols, ["unnamed:0", "tipo", "seccion"]) or cols[0]
+            col_desc = find_col(cols, ["descripcion", "descripción"]) or cols[1]
+            col_fecha = find_col(cols, ["fecha"]) or cols[3]
+            col_entra = find_col(cols, ["entra", "ingresa", "ingreso"]) or cols[4]
 
-            # ubicar inicio bloque INGRESOS
+            # inicio de INGRESOS
             idx_ing = df.index[df[col_tipo].fillna("").astype(str).str.strip().eq("INGRESOS")]
             if len(idx_ing) == 0:
                 print(f"⚠️ {archivo}: no se encontró sección INGRESOS")
@@ -147,7 +165,7 @@ def importar_historico_overwrite():
 
             start = int(idx_ing[0])
 
-            # ubicar fin bloque INGRESOS (evita 'nan' como texto)
+            # fin de bloque: cuando col_tipo tenga un encabezado real
             end = len(df)
             for i in range(start + 1, len(df)):
                 v = norm_cell(df.loc[i, col_tipo])
@@ -157,7 +175,9 @@ def importar_historico_overwrite():
 
             bloque = df.iloc[start:end].copy()
 
-            filas = []
+            reescritos_arch = 0
+            saltados_arch = 0
+
             for _, row in bloque.iterrows():
                 desc = row.get(col_desc, "")
                 if not es_fila_pago_principal(desc):
@@ -169,26 +189,23 @@ def importar_historico_overwrite():
 
                 fecha = parse_fecha(row.get(col_fecha, None), archivo)
                 mes = yyyymm(fecha)
-                monto = money_to_float(row.get(col_entra, 0))  # puede ser 0.0
+                monto = money_to_float(row.get(col_entra, 0))
 
-                filas.append((casa, fecha, mes, monto))
+                # CLAVE: no pisar valores existentes con 0 (a menos que lo fuerces)
+                if monto == 0.0 and not FORZAR_REESCRITURA_CON_CERO:
+                    saltados_arch += 1
+                    continue
 
-            if not filas:
-                print(f"⚠️ {archivo}: no se detectaron casas para importar")
-                continue
-
-            # Overwrite por casa+mes
-            reescritos_arch = 0
-            for casa, fecha, mes, monto in filas:
                 borrar_mes_casa(cur, casa, mes)
+
                 prov, deci, suel, oper = calcular_fondos(monto)
                 cur.execute(insert_sql, (casa, fecha, monto, prov, deci, suel, oper, USUARIO_CARGA))
                 reescritos_arch += 1
 
             conn.commit()
-            total_archivos += 1
             total_reescritos += reescritos_arch
-            print(f"✅ {archivo}: reescritos={reescritos_arch}")
+            total_saltados_por_cero += saltados_arch
+            print(f"✅ {archivo}: reescritos={reescritos_arch} | saltados_por_monto0={saltados_arch}")
 
         except FileNotFoundError:
             print(f"❌ No existe el archivo: {archivo}")
@@ -196,8 +213,8 @@ def importar_historico_overwrite():
             print(f"❌ {archivo}: error -> {e}")
 
     conn.close()
-    print(f"\nRESUMEN: archivos_procesados={total_archivos} | reescritos_total={total_reescritos}")
+    print(f"\nRESUMEN: reescritos_total={total_reescritos} | saltados_por_monto0_total={total_saltados_por_cero}")
 
 
 if __name__ == "__main__":
-    importar_historico_overwrite()
+    importar_historico_overwrite_seguro()

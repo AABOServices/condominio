@@ -1,72 +1,85 @@
 import sqlite3
-import pandas as pd
 from datetime import datetime
 
 DB_PATH = "condominio.db"
 
-def ensure_table(conn: sqlite3.Connection):
+CASAS = [f"C{i:02d}" for i in range(1, 11)]  # C01..C10
+
+
+def create_propietarios_table(conn: sqlite3.Connection):
     cur = conn.cursor()
+
+    # Tabla principal de propietarios (1 fila por casa)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS propietarios (
-            casa TEXT PRIMARY KEY,
-            propietario TEXT NOT NULL,
-            fecha_ultimo_registro TEXT,
-            actualizado_en TEXT NOT NULL
+            casa TEXT PRIMARY KEY,                 -- C01..C10
+
+            foto_path TEXT,                        -- ruta local o URL si luego manejas uploads
+            nombre TEXT,
+            cedula TEXT,
+            telefono_fijo TEXT,
+            celular TEXT,
+            area REAL,                             -- m2 o unidad que manejen
+            alicuota_pct REAL,                     -- % alícuota
+            email TEXT,
+
+            tiene_arrendatario INTEGER DEFAULT 0,  -- 0/1 (radio button en UI)
+            no_autos INTEGER DEFAULT 0,            -- número de autos
+
+            placa1 TEXT,
+            placa2 TEXT,
+            placa3 TEXT,
+            placa4 TEXT,
+            placa5 TEXT,
+            placa6 TEXT,
+
+            asistente_hogar INTEGER DEFAULT 0,     -- 0/1
+            asistente_nombre TEXT,                 -- solo si asistente_hogar=1
+
+            actualizado_en TEXT
         )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_propietarios_propietario ON propietarios(propietario)")
+
+    # Índices útiles
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_prop_nombre ON propietarios(nombre)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_prop_cedula ON propietarios(cedula)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_prop_email ON propietarios(email)")
+
     conn.commit()
 
-def rebuild_from_pagos(conn: sqlite3.Connection):
+
+def seed_casas(conn: sqlite3.Connection):
     """
-    Regla:
-    - Para cada casa, toma el propietario del registro más reciente (MAX(fecha_pago)).
-    - Si fecha_pago es NULL, lo deja al final (no debería ocurrir si tu CSV está bien).
+    Crea las 10 casas como registros base (vacíos), sin sobrescribir
+    si ya existen.
     """
-    df = pd.read_sql_query("""
-        SELECT casa, propietario, fecha_pago
-        FROM pagos
-        WHERE casa IS NOT NULL AND TRIM(casa) <> ''
-    """, conn)
-
-    if df.empty:
-        print("⚠️ No hay datos en 'pagos'. No se puede construir propietarios.")
-        return 0
-
-    df["fecha_pago"] = pd.to_datetime(df["fecha_pago"], errors="coerce")
-    df["casa"] = df["casa"].astype(str).str.strip().str.upper()
-    df["propietario"] = df["propietario"].astype(str).str.strip()
-
-    # Tomar el último registro por casa
-    df = df.sort_values(["casa", "fecha_pago"], ascending=[True, True])
-    idx = df.groupby("casa")["fecha_pago"].idxmax()
-    df_last = df.loc[idx, ["casa", "propietario", "fecha_pago"]].copy()
-
-    df_last["fecha_ultimo_registro"] = df_last["fecha_pago"].dt.strftime("%Y-%m-%d")
-    df_last.drop(columns=["fecha_pago"], inplace=True)
-
-    # Reemplazar tabla (maestro) completamente
     cur = conn.cursor()
-    cur.execute("DELETE FROM propietarios")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    actualizado_en = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cur.executemany("""
-        INSERT INTO propietarios (casa, propietario, fecha_ultimo_registro, actualizado_en)
-        VALUES (?, ?, ?, ?)
-    """, [
-        (r["casa"], r["propietario"], r["fecha_ultimo_registro"], actualizado_en)
-        for _, r in df_last.iterrows()
-    ])
+    for casa in CASAS:
+        cur.execute("""
+            INSERT OR IGNORE INTO propietarios (casa, actualizado_en)
+            VALUES (?, ?)
+        """, (casa, now))
 
     conn.commit()
-    print(f"✅ Maestro propietarios actualizado: {len(df_last)} casas")
-    return len(df_last)
 
-def main():
+
+def main(recreate: bool = False):
     conn = sqlite3.connect(DB_PATH)
-    ensure_table(conn)
-    rebuild_from_pagos(conn)
+    cur = conn.cursor()
+
+    if recreate:
+        cur.execute("DROP TABLE IF EXISTS propietarios")
+        conn.commit()
+
+    create_propietarios_table(conn)
+    seed_casas(conn)
+
     conn.close()
+    print("✅ Tabla propietarios lista y 10 casas precargadas (C01..C10).")
+
 
 if __name__ == "__main__":
-    main()
+    # Cambia a True si quieres borrar y recrear la tabla desde cero
+    main(recreate=False)
